@@ -3,14 +3,99 @@
 	<head>
 		<meta charset="UTF-8" />
 		<meta name="viewport" content="width=device-width, initial-scale=1.0" />
-		<title>Document</title>
+		<title>Voice Agent</title>
 		<style>
 			* {
-				background-color: black;
+				box-sizing: border-box;
+				margin: 0;
+				padding: 0;
+			}
+			body {
+				background-color: #121212;
+				color: #e0e0e0;
+				font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+				display: flex;
+				flex-direction: column;
+				align-items: center;
+				justify-content: flex-start;
+				min-height: 100vh;
+				padding: 2rem;
+			}
+			.container {
+				max-width: 600px;
+				width: 100%;
+				display: flex;
+				flex-direction: column;
+				align-items: center;
+				justify-content: center;
+				gap: 1.5rem;
+			}
+			h1 {
+				font-size: 1.8rem;
+				font-weight: 600;
+				color: #ffffff;
+			}
+			#status {
+				font-size: 1rem;
+				color: #a0a0a0;
+				padding: 0.5rem 1rem;
+				border-radius: 20px;
+				background: #1e1e1e;
+				border: 1px solid #333;
+			}
+			button {
+				padding: 0.8rem 1.8rem;
+				font-size: 1rem;
+				font-weight: 600;
+				color: #fff;
+				background-color: #2563eb;
+				border: none;
+				border-radius: 9999px;
+				cursor: pointer;
+				transition: background-color 0.2s, transform 0.1s;
+			}
+			button:hover {
+				background-color: #1d4ed8;
+			}
+			button:active {
+				transform: scale(0.98);
+			}
+			button.listening {
+				background-color: #dc2626;
+			}
+			#log {
+				width: 100%;
+				display: flex;
+				flex-direction: column;
+				gap: 0.75rem;
+				margin-top: 1rem;
+			}
+			.msg {
+				padding: 0.8rem 1.2rem;
+				border-radius: 12px;
+				max-width: 85%;
+				line-height: 1.4;
+			}
+			.msg.user {
+				background-color: #2a2a2a;
+				align-self: flex-end;
+				border-bottom-right-radius: 4px;
+			}
+			.msg.ai {
+				background-color: #1e3a5f;
+				align-self: flex-start;
+				border-bottom-left-radius: 4px;
 			}
 		</style>
 	</head>
 	<body>
+		<div class="container">
+			<h1>🎙️ Voice Agent</h1>
+			<button id="toggle-btn">Start Listening</button>
+			<div id="status">Click "Start Listening" to begin</div>
+			<div id="log"></div>
+		</div>
+
 		<script type="module" src="./script.js"></script>
 	</body>
 </html>

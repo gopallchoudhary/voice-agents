@@ -22,19 +22,51 @@ app.post("/api/chat", async (req, res) => {
 			return res.status(400).json({ error: "userText is required" });
 		}
 
-		console.log(`Received user query: "${userText}"`);
+		console.log(`\n📥 Received user query: "${userText}"`);
 
-		const response = await client.chat.completions.create({
+		// 1. Generate text response from LLM
+		const completion = await client.chat.completions.create({
 			model: "gpt-4o-mini",
-			messages: [{ role: "user", content: userText }],
+			messages: [
+				{
+					role: "system",
+					content:
+						"You are a helpful voice assistant. Keep answers clear, natural, and conversational (1-3 sentences max).",
+				},
+				{ role: "user", content: userText },
+			],
 		});
 
-		const outputText = response.choices[0]?.message?.content ?? "";
-		console.log(`LLM Reply: "${outputText}"`);
+		const outputText = completion.choices[0]?.message?.content ?? "";
+		console.log(`🤖 LLM Reply: "${outputText}"`);
 
-		res.json({ reply: outputText });
+		// 2. Generate spoken audio using Kokoro TTS
+		let audioDataUrl = null;
+		try {
+			console.log("🔊 Generating TTS audio...");
+			const speechResponse = await client.audio.speech.create({
+				model: "hexgrad/kokoro-82m",
+				voice: "af_alloy",
+				input: outputText,
+				response_format: "mp3",
+			});
+
+			const arrayBuffer = await speechResponse.arrayBuffer();
+			const buffer = Buffer.from(arrayBuffer);
+			const base64Audio = buffer.toString("base64");
+			audioDataUrl = `data:audio/mp3;base64,${base64Audio}`;
+			console.log(`✅ Audio generated (${buffer.length} bytes)`);
+		} catch (ttsError) {
+			console.error("⚠️ TTS generation failed:", ttsError.message);
+		}
+
+		// 3. Return both text and audio
+		res.json({
+			reply: outputText,
+			audio: audioDataUrl,
+		});
 	} catch (error) {
-		console.error("OpenAI API error:", error);
+		console.error("❌ Server error:", error);
 		res.status(500).json({ error: error.message });
 	}
 });
@@ -42,3 +74,6 @@ app.post("/api/chat", async (req, res) => {
 app.listen(PORT, () => {
 	console.log(`🚀 Backend server running at http://localhost:${PORT}`);
 });
+
+// Keep process alive when launched as background process
+process.stdin.resume();

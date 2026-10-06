@@ -3,6 +3,11 @@ const API_URL =
 		? "/api/chat"
 		: "http://localhost:5000/api/chat";
 
+const STREAM_URL =
+	window.location.port === "5000"
+		? "/api/chat-stream"
+		: "http://localhost:5000/api/chat-stream";
+
 const statusEl = document.getElementById("status");
 const toggleBtn = document.getElementById("toggle-btn");
 const logEl = document.getElementById("log");
@@ -39,6 +44,8 @@ const state = {
 	resumeTimerId: null,
 	// final result indexes already sent to the LLM (Chrome re-fires onresult)
 	processedFinalIndexes: new Set(),
+	// AbortController for the currently active SSE text stream (if any)
+	activeStreamAbort: null,
 };
 
 function updateStatus(text) {
@@ -53,6 +60,18 @@ function appendMessage(role, text) {
 	div.textContent = `${role === "user" ? "You: " : "AI: "}${text}`;
 	logEl.appendChild(div);
 	div.scrollIntoView({ behavior: "smooth" });
+}
+
+// Creates an empty AI bubble for progressive streaming text.
+// Returns the node so the consumer can patch `textContent` per chunk.
+function appendStreamingMessage() {
+	if (!logEl) return null;
+	const div = document.createElement("div");
+	div.className = "msg ai";
+	div.textContent = "AI: …";
+	logEl.appendChild(div);
+	div.scrollIntoView({ behavior: "smooth" });
+	return div;
 }
 
 function normalizeText(s) {
@@ -141,8 +160,175 @@ function scheduleResume() {
 	}, INTERRUPT_RESUME_DELAY_MS);
 }
 
-async function* llmStreaming(userText = "") {
-	yield { textContect: "", isFinal: false };
+// Streams the assistant reply for `userText` as an async generator.
+//
+// Yielded chunk shape (accumulated text on every yield):
+//   { textContent, isFinal, delta?, reply?, audio? }
+// `textContect` is included as a legacy alias of `textContent`.
+//   - per-token:   { textContent, isFinal: false, delta }
+//   - text done:   { textContent, isFinal: false, reply }  (audio pending)
+//   - stream done: { textContent, isFinal: true, reply, audio }
+// Pass an AbortSignal (e.g. barge-in / stop) via `options.signal`.
+// Falls back to the non-streaming /api/chat endpoint when SSE is
+// unavailable (404, no body stream, or network failure).
+async function* llmStreaming(userText = "", options = {}) {
+	const externalSignal = options.signal;
+	const ctrl = new AbortController();
+	const forwardAbort = () => {
+		try {
+			ctrl.abort();
+		} catch (_) {}
+	};
+	if (externalSignal) {
+		if (externalSignal.aborted) {
+			ctrl.abort();
+		} else {
+			externalSignal.addEventListener("abort", forwardAbort, { once: true });
+		}
+	}
+
+	let accumulated = "";
+	const snapshot = (extra = {}) => ({
+		textContent: accumulated,
+		// legacy alias (kept for callers using the original stub's key)
+		textContect: accumulated,
+		isFinal: false,
+		...extra,
+	});
+
+	const cleanup = () => {
+		if (externalSignal) {
+			externalSignal.removeEventListener("abort", forwardAbort);
+		}
+	};
+
+	try {
+		let res;
+		try {
+			res = await fetch(STREAM_URL, {
+				method: "POST",
+				headers: {
+					"Content-Type": "application/json",
+					Accept: "text/event-stream",
+				},
+				body: JSON.stringify({ userText }),
+				signal: ctrl.signal,
+			});
+		} catch (err) {
+			if (err?.name === "AbortError") return;
+			throw err;
+		}
+
+		// Fallback: SSE endpoint missing or body not streamable -> one-shot JSON.
+		if (!res.ok || !res.body || res.status === 404) {
+			if (res.status === 404 || !res.body) {
+				console.warn("[Stream] SSE unavailable, falling back to /api/chat.");
+				const data = await llm(userText);
+				if (ctrl.signal.aborted) return;
+				accumulated = data.reply || "";
+				yield {
+					textContent: accumulated,
+					textContect: accumulated,
+					isFinal: true,
+					reply: accumulated,
+					audio: data.audio ?? null,
+				};
+				return;
+			}
+			let message = `HTTP ${res.status}`;
+			try {
+				const err = await res.json();
+				message = err.error || message;
+			} catch (_) {}
+			throw new Error(message);
+		}
+
+		const reader = res.body.getReader();
+		const decoder = new TextDecoder();
+		let buffer = "";
+		let finalReply = null;
+		let finalAudio = null;
+
+		const handleBlock = function* (eventType, rawData) {
+			if (!eventType || eventType.startsWith(":")) return;
+			let data;
+			try {
+				data = rawData ? JSON.parse(rawData) : {};
+			} catch (_) {
+				return;
+			}
+			if (eventType === "delta" && typeof data.text === "string" && data.text) {
+				accumulated += data.text;
+				yield snapshot({ delta: data.text });
+			} else if (eventType === "done" && typeof data.reply === "string") {
+				accumulated = data.reply;
+				finalReply = data.reply;
+				yield snapshot({ reply: finalReply });
+			} else if (eventType === "audio") {
+				if (typeof data.reply === "string") {
+					accumulated = data.reply;
+					finalReply = data.reply;
+				}
+				finalAudio = data.audio ?? null;
+			} else if (eventType === "error") {
+				throw new Error(data.error || "Stream error");
+			}
+			// "end" and unknown events: no yield, handled by loop end.
+		};
+
+		const drainBuffer = function* () {
+			let idx;
+			while ((idx = buffer.indexOf("\n\n")) !== -1) {
+				const block = buffer.slice(0, idx);
+				buffer = buffer.slice(idx + 2);
+				if (!block.trim()) continue;
+				let eventType = "";
+				const dataLines = [];
+				for (const line of block.split("\n")) {
+					if (line.startsWith("event:")) {
+						eventType = line.slice(6).trim();
+					} else if (line.startsWith("data:")) {
+						dataLines.push(line.slice(5).trim());
+					} else if (line.startsWith(":")) {
+						// SSE comment / heartbeat — ignore.
+					}
+				}
+				yield* handleBlock(eventType, dataLines.join("\n"));
+			}
+		};
+
+		while (true) {
+			if (ctrl.signal.aborted) {
+				try {
+					await reader.cancel();
+				} catch (_) {}
+				return;
+			}
+			let read;
+			try {
+				read = await reader.read();
+			} catch (err) {
+				if (err?.name === "AbortError") return;
+				throw err;
+			}
+			if (read.done) break;
+			buffer += decoder.decode(read.value, { stream: true });
+			yield* drainBuffer();
+		}
+		buffer += decoder.decode();
+		yield* drainBuffer();
+
+		if (ctrl.signal.aborted) return;
+		yield {
+			textContent: accumulated,
+			textContect: accumulated,
+			isFinal: true,
+			reply: finalReply ?? accumulated,
+			audio: finalAudio,
+		};
+	} finally {
+		cleanup();
+	}
 }
 
 // Play TTS audio. Mic is intentionally LEFT OPEN so interim results can
@@ -217,26 +403,42 @@ function speak(audioUrl, replyText = "", epoch = requestEpoch, startAt = 0) {
 
 // Called on qualifying interim speech while TTS is playing.
 function handleBargeIn(interimText) {
-	if (!state.currentlyPlaying) return;
+	if (!state.currentlyPlaying && !state.activeStreamAbort) return;
 	// Invalidate anything in flight (finish-but-don't-play for stale replies)
 	requestEpoch += 1;
+	// Abort an in-progress SSE text stream so its reader stops promptly.
+	if (state.activeStreamAbort) {
+		try {
+			state.activeStreamAbort.abort();
+		} catch (_) {}
+		state.activeStreamAbort = null;
+	}
 	const paused = stopCurrentAudioForInterrupt(`barge-in: "${interimText}"`);
 	state.pausedForInterrupt = paused;
 	state.lastInterimText = "";
 	state.interruptCandidateCount = 0;
 	updateStatus("🎤 Listening (you interrupted)...");
 	// If the interim was echo and no real final follows, resume where we cut.
-	scheduleResume();
+	if (paused) scheduleResume();
 }
 
 // Fast path for interim results: detect natural interruption.
+// Fires while TTS audio plays (cut audio) and while the SSE text stream
+// is still arriving (abort stream) — no audio means no echo, so the
+// grace/echo gates are skipped in the text-streaming case.
 function maybeInterruptFromInterim(interimText, confidence) {
-	if (!isListening || !state.currentlyPlaying || !state.currentAudioObject)
-		return;
+	if (!isListening) return;
+	const interruptingAudio =
+		state.currentlyPlaying && state.currentAudioObject;
+	const interruptingStream =
+		!interruptingAudio && state.activeStreamAbort;
+	if (!interruptingAudio && !interruptingStream) return;
 	const current = state.currentAudioObject;
 
-	// 1. Grace window — echo spike right after play() starts.
-	if (Date.now() - current.startTime < INTERRUPT_GRACE_MS) return;
+	if (interruptingAudio) {
+		// 1. Grace window — echo spike right after play() starts.
+		if (Date.now() - current.startTime < INTERRUPT_GRACE_MS) return;
+	}
 
 	const text = (interimText || "").trim();
 	// 2. Minimum strength.
@@ -248,9 +450,11 @@ function maybeInterruptFromInterim(interimText, confidence) {
 	) {
 		return;
 	}
-	// 3. Self-text match — AI hearing its own voice.
-	if (isEchoOfReply(text, current.replyText || state.lastReplyText)) {
-		return;
+	if (interruptingAudio) {
+		// 3. Self-text match — AI hearing its own voice.
+		if (isEchoOfReply(text, current.replyText || state.lastReplyText)) {
+			return;
+		}
 	}
 	// 4. Sustained speech — require consecutive interim frames, not one blip.
 	const norm = normalizeText(text);
@@ -291,7 +495,8 @@ async function llm(userText) {
 	}
 }
 
-// Final (confirmed) user speech -> LLM -> TTS, with stale-epoch drop.
+// Final (confirmed) user speech -> streamed LLM text -> TTS,
+// with stale-epoch drop.
 async function handleFinalTranscript(transcript) {
 	if (!isListening) return;
 	const myEpoch = ++requestEpoch;
@@ -303,22 +508,62 @@ async function handleFinalTranscript(transcript) {
 
 	console.log("User:", transcript);
 	appendMessage("user", transcript);
+	updateStatus("✍️ Replying...");
 
-	const data = await llm(transcript);
-	if (myEpoch !== requestEpoch) {
-		// A newer turn / barge-in superseded this one: show text, skip audio.
+	const aiBubble = appendStreamingMessage();
+	const streamCtrl = new AbortController();
+	state.activeStreamAbort = streamCtrl;
+	let latest = { textContent: "", reply: "", audio: null };
+
+	try {
+		for await (const chunk of llmStreaming(transcript, {
+			signal: streamCtrl.signal,
+		})) {
+			// Superseded by a barge-in / newer turn / stop: abort and drop.
+			if (myEpoch !== requestEpoch || !isListening) {
+				try {
+					streamCtrl.abort();
+				} catch (_) {}
+				break;
+			}
+			latest = chunk;
+			if (aiBubble) {
+				aiBubble.textContent = `AI: ${chunk.textContent}`;
+			}
+		}
+	} catch (err) {
+		if (err?.name !== "AbortError") {
+			console.error("Stream error:", err);
+			if (aiBubble) aiBubble.textContent = `AI: Error: ${err.message}`;
+			if (isListening && !state.currentlyPlaying) {
+				updateStatus("🎤 Listening...");
+			}
+		}
+	} finally {
+		if (state.activeStreamAbort === streamCtrl) {
+			state.activeStreamAbort = null;
+		}
+	}
+
+	if (myEpoch !== requestEpoch || !isListening) {
+		// A newer turn / barge-in superseded this one: leave the partial
+		// text visible but never play its audio.
 		console.log(
 			`[Stale] Dropping audio for superseded turn (epoch ${myEpoch} != ${requestEpoch}).`,
 		);
-		console.log("AI (dropped audio):", data.reply);
-		appendMessage("ai", data.reply);
 		return;
 	}
-	console.log("AI:", data.reply);
-	appendMessage("ai", data.reply);
+	const reply = latest.reply ?? latest.textContent;
+	console.log("AI:", reply);
+	if (aiBubble) {
+		aiBubble.textContent = `AI: ${reply}`;
+		aiBubble.scrollIntoView({ behavior: "smooth" });
+	} else {
+		appendMessage("ai", reply);
+	}
 
-	if (data.audio) {
-		await speak(data.audio, data.reply, myEpoch);
+	if (latest.audio) {
+		await speak(latest.audio, reply, myEpoch);
 	} else if (isListening && !state.currentlyPlaying) {
 		updateStatus("🎤 Listening...");
 	}
@@ -430,6 +675,12 @@ function setup() {
 				requestEpoch += 1; // invalidate in-flight turns
 				cancelResumeTimer();
 				state.pausedForInterrupt = null;
+				if (state.activeStreamAbort) {
+					try {
+						state.activeStreamAbort.abort();
+					} catch (_) {}
+					state.activeStreamAbort = null;
+				}
 				stopCurrentAudioForInterrupt("agent stopped");
 				toggleBtn.textContent = "Start Listening";
 				toggleBtn.classList.remove("listening");

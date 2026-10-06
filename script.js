@@ -25,6 +25,11 @@ function appendMessage(role, text) {
 	div.scrollIntoView({ behavior: "smooth" });
 }
 
+const state = {
+	currentlyPlaying: false,
+	currentAudioObject: null,
+};
+
 // Play TTS Audio and prevent mic feedback
 function speak(audioUrl) {
 	return new Promise((resolve) => {
@@ -43,6 +48,11 @@ function speak(audioUrl) {
 
 		const audio = new Audio(audioUrl);
 
+		state.currentAudioObject = {
+			audioUrl,
+			audio,
+		};
+
 		const finishSpeaking = () => {
 			isSpeaking = false;
 			// Resume listening if agent is still turned on
@@ -55,7 +65,10 @@ function speak(audioUrl) {
 			resolve();
 		};
 
-		audio.onended = finishSpeaking;
+		audio.onended = () => {
+			finishSpeaking()
+			state.currentAudioObject = null
+		}
 		audio.onerror = (err) => {
 			console.error("Audio playback error:", err);
 			finishSpeaking();
@@ -65,6 +78,8 @@ function speak(audioUrl) {
 			console.error("Autoplay prevented:", err);
 			finishSpeaking();
 		});
+
+		
 	});
 }
 
@@ -131,12 +146,17 @@ function initSpeechRecognition() {
 	};
 
 	sr.onresult = async function (event) {
-		const transcript = event.results[event.results.length - 1][0].transcript.trim();
+		const transcript =
+			event.results[event.results.length - 1][0].transcript.trim();
 		if (!transcript) return;
 
 		console.log("User:", transcript);
 		appendMessage("user", transcript);
 
+		if (state.currentAudioObject) {
+			state.currentAudioObject.audio.pause();
+			URL.revokeObjectURL(state.currentAudioObject.audioUrl)
+		}
 		const data = await llm(transcript);
 		console.log("AI:", data.reply);
 		appendMessage("ai", data.reply);

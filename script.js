@@ -114,7 +114,9 @@ function stopCurrentAudioForInterrupt(reason) {
 			current.resolve();
 		} catch (_) {}
 	}
-	console.log(`[Interrupt] TTS cut (${reason}) at ${snapshot.currentTime.toFixed(2)}s`);
+	console.log(
+		`[Interrupt] TTS cut (${reason}) at ${snapshot.currentTime.toFixed(2)}s`,
+	);
 	return snapshot;
 }
 
@@ -125,14 +127,22 @@ function scheduleResume() {
 		const paused = state.pausedForInterrupt;
 		// Only resume if nothing else took over (no new final, no new audio)
 		if (paused && !state.currentAudioObject && isListening) {
-			console.log("[Interrupt] No follow-up speech — resuming TTS (false trigger).");
+			console.log(
+				"[Interrupt] No follow-up speech — resuming TTS (false trigger).",
+			);
 			state.pausedForInterrupt = null;
 			state.lastInterimText = "";
 			state.interruptCandidateCount = 0;
 			const epoch = requestEpoch;
-			speak(paused.audioUrl, paused.replyText, epoch, paused.currentTime).catch(() => {});
+			speak(paused.audioUrl, paused.replyText, epoch, paused.currentTime).catch(
+				() => {},
+			);
 		}
 	}, INTERRUPT_RESUME_DELAY_MS);
+}
+
+async function* llmStreaming(userText = "") {
+	yield { textContect: "", isFinal: false };
 }
 
 // Play TTS audio. Mic is intentionally LEFT OPEN so interim results can
@@ -221,7 +231,8 @@ function handleBargeIn(interimText) {
 
 // Fast path for interim results: detect natural interruption.
 function maybeInterruptFromInterim(interimText, confidence) {
-	if (!isListening || !state.currentlyPlaying || !state.currentAudioObject) return;
+	if (!isListening || !state.currentlyPlaying || !state.currentAudioObject)
+		return;
 	const current = state.currentAudioObject;
 
 	// 1. Grace window — echo spike right after play() starts.
@@ -230,7 +241,11 @@ function maybeInterruptFromInterim(interimText, confidence) {
 	const text = (interimText || "").trim();
 	// 2. Minimum strength.
 	if (text.length < INTERRUPT_MIN_CHARS) return;
-	if (typeof confidence === "number" && confidence >= 0 && confidence < INTERRUPT_MIN_CONFIDENCE) {
+	if (
+		typeof confidence === "number" &&
+		confidence >= 0 &&
+		confidence < INTERRUPT_MIN_CONFIDENCE
+	) {
 		return;
 	}
 	// 3. Self-text match — AI hearing its own voice.
@@ -240,7 +255,10 @@ function maybeInterruptFromInterim(interimText, confidence) {
 	// 4. Sustained speech — require consecutive interim frames, not one blip.
 	const norm = normalizeText(text);
 	const prev = normalizeText(state.lastInterimText);
-	if (prev && (norm.startsWith(prev) || prev.startsWith(norm) || norm.includes(prev))) {
+	if (
+		prev &&
+		(norm.startsWith(prev) || prev.startsWith(norm) || norm.includes(prev))
+	) {
 		state.interruptCandidateCount += 1;
 	} else {
 		state.interruptCandidateCount = 1;
@@ -289,7 +307,9 @@ async function handleFinalTranscript(transcript) {
 	const data = await llm(transcript);
 	if (myEpoch !== requestEpoch) {
 		// A newer turn / barge-in superseded this one: show text, skip audio.
-		console.log(`[Stale] Dropping audio for superseded turn (epoch ${myEpoch} != ${requestEpoch}).`);
+		console.log(
+			`[Stale] Dropping audio for superseded turn (epoch ${myEpoch} != ${requestEpoch}).`,
+		);
 		console.log("AI (dropped audio):", data.reply);
 		appendMessage("ai", data.reply);
 		return;
@@ -333,7 +353,10 @@ function initSpeechRecognition() {
 		}
 		if (event.error === "network") {
 			updateStatus("❌ Network error: Check internet/mic or run on localhost.");
-		} else if (event.error === "not-allowed" || event.error === "service-not-allowed") {
+		} else if (
+			event.error === "not-allowed" ||
+			event.error === "service-not-allowed"
+		) {
 			updateStatus("❌ Mic blocked: allow microphone permission and reload.");
 			isListening = false;
 			if (toggleBtn) {
@@ -373,7 +396,8 @@ function initSpeechRecognition() {
 					console.error("Final handling error:", err),
 				);
 			} else {
-				const confidence = typeof alt.confidence === "number" ? alt.confidence : undefined;
+				const confidence =
+					typeof alt.confidence === "number" ? alt.confidence : undefined;
 				maybeInterruptFromInterim(transcript, confidence);
 			}
 		}
